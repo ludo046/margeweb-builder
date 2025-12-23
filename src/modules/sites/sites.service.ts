@@ -1,96 +1,115 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/sequelize';
+import { Op } from 'sequelize';
 import { Site } from '../../models/site.model';
-import { Page } from '../../models/page.model';
-import { Section } from '../../models/section.model';
+import { CreateSiteDto } from './dto/create-site.dto';
+import { UpdateSiteDto } from './dto/update-sites.dto';
+
+function slugify(input: string): string {
+  return input
+    .toLowerCase()
+    .trim()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '') // accents
+    .replace(/[^a-z0-9]+/g, '-')     // non alnum -> -
+    .replace(/^-+|-+$/g, '')         // trim -
+    .slice(0, 80) || 'site';
+}
 
 @Injectable()
 export class SitesService {
-  constructor(
-    @InjectModel(Site) private siteModel: typeof Site,
-    @InjectModel(Page) private pageModel: typeof Page,
-    @InjectModel(Section) private sectionModel: typeof Section,
-  ) {}
-
-  private isAdmin(u: any) {
-    return u?.role === 'ADMIN_PLATFORM' && !u?.imp;
-  }
-
-  private async assertSiteAccess(u: any, siteId: number) {
-    const site = await this.siteModel.findByPk(siteId);
-    if (!site) throw new NotFoundException('Site not found');
-    if (!this.isAdmin(u) && site.tenant_id !== u.tenant_id) throw new ForbiddenException();
-    return site;
-  }
+  constructor(@InjectModel(Site) private readonly siteModel: typeof Site) {}
 
   async listSites(u: any) {
-    const where = this.isAdmin(u) ? {} : { tenant_id: u.tenant_id };
-    return this.siteModel.findAll({ where, order: [['created_at', 'DESC']], limit: 200 });
-  }
+    const role = u?.role ?? null;
+    const tenantId = u?.tenant_id ?? null;
 
-  async createSite(u: any, dto: any) {
-    return this.siteModel.create({
-      tenant_id: u.tenant_id,
-      name: dto.name,
-      slug: dto.slug,
-      domain: dto.domain ?? null,
-      subdomain: dto.subdomain ?? null,
-      status: 'draft',
-    } as any);
-  }
-
-  async listPages(u: any, siteId: number) {
-    await this.assertSiteAccess(u, siteId);
-    return this.pageModel.findAll({ where: { site_id: siteId }, order: [['created_at', 'ASC']] });
-  }
-
-  async createPage(u: any, siteId: number, dto: any) {
-    await this.assertSiteAccess(u, siteId);
-
-    // si is_home=true, on retire is_home aux autres pages du site (V1 simple)
-    if (dto.is_home) {
-      await this.pageModel.update({ is_home: false }, { where: { site_id: siteId } });
+    if (role === 'ADMIN_PLATFORM') {
+      return this.siteModel.findAll({ order: [['created_at', 'DESC']] });
     }
 
-    return this.pageModel.create({
-      site_id: siteId,
-      title: dto.title,
-      slug: dto.slug,
-      is_home: !!dto.is_home,
-      status: 'draft',
-    } as any);
-  }
+    if (!tenantId) throw new UnauthorizedException('Missing tenant in token');
 
-  async getPage(u: any, pageId: number) {
-    const page = await this.pageModel.findByPk(pageId);
-    if (!page) throw new NotFoundException('Page not found');
-
-    const site = await this.assertSiteAccess(u, page.site_id);
-    return { page, site };
-  }
-
-  async listSections(u: any, pageId: number) {
-    const page = await this.pageModel.findByPk(pageId);
-    if (!page) throw new NotFoundException('Page not found');
-    await this.assertSiteAccess(u, page.site_id);
-
-    return this.sectionModel.findAll({
-      where: { page_id: pageId },
-      order: [['sort_order', 'ASC'], ['created_at', 'ASC']],
+    return this.siteModel.findAll({
+      where: { tenant_id: Number(tenantId) },
+      order: [['created_at', 'DESC']],
     });
   }
 
-  async createSection(u: any, pageId: number, dto: any) {
-    const page = await this.pageModel.findByPk(pageId);
-    if (!page) throw new NotFoundException('Page not found');
-    await this.assertSiteAccess(u, page.site_id);
+  private async ensureUniqueSlug(tenantId: number, base: string) {
+    let slug = base;
+    let i = 2;
 
-    return this.sectionModel.create({
-      page_id: pageId,
-      type: dto.type,
-      sort_order: dto.sort_order ?? 0,
-      data: dto.data,
-      style: dto.style ?? null,
+    // cherche si slug existe déjà pour ce tenant
+    // (si ta contrainte est globale, enlève tenant_id du where)
+    while (
+      await this.siteModel.findOne({
+        where: { tenant_id: tenantId, slug },
+        attributes: ['id'],
+      })
+    ) {
+      slug = `${base}-${i++}`.slice(0, 80);
+    }
+    return slug;
+  }
+
+  async createSite(dto: CreateSiteDto) {
+    const now = new Date();
+
+    // ✅ slug base : subdomain si fourni, sinon name
+    const base = slugify(dto.subdomain?.trim() || dto.name);
+    const slug = await this.ensureUniqueSlug(dto.tenant_id, base);
+
+    const site = await this.siteModel.create({
+      tenant_id: dto.tenant_id,
+      name: dto.name,
+      slug, // ✅ FIX
+      subdomain: dto.subdomain ?? null,
+      domain: dto.domain ?? null,
+      status: 'draft',
+      created_at: now,
+      updated_at: now,
     } as any);
+
+    return site;
+  }
+
+  async getSite(u: any, id: number) {
+    const site = await this.siteModel.findByPk(id);
+    if (!site) throw new NotFoundException('Site not found');
+
+    const role = u?.role ?? null;
+    const tenantId = u?.tenant_id ?? null;
+
+    if (role !== 'ADMIN_PLATFORM' && Number(site.tenant_id) !== Number(tenantId)) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    return site;
+  }
+
+  async updateSite(u: any, id: number, dto: UpdateSiteDto) {
+    const site = await this.siteModel.findByPk(id);
+    if (!site) throw new NotFoundException('Site not found');
+
+    const role = u?.role ?? null;
+    const tenantId = u?.tenant_id ?? null;
+
+    if (role !== 'ADMIN_PLATFORM' && Number(site.tenant_id) !== Number(tenantId)) {
+      throw new ForbiddenException('Forbidden');
+    }
+
+    if (dto.name !== undefined) (site as any).name = dto.name;
+    if (dto.status !== undefined) (site as any).status = dto.status;
+
+    (site as any).updated_at = new Date();
+    await site.save();
+
+    return site;
   }
 }

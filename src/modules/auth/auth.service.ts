@@ -1,183 +1,223 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
-import { InjectModel } from '@nestjs/sequelize';
-import { ConfigService } from '@nestjs/config';
-import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
-import { randomBytes, createHash, createCipheriv, createDecipheriv } from 'crypto';
+import { InjectModel } from '@nestjs/sequelize';
+import * as bcrypt from 'bcryptjs';
+import * as crypto from 'crypto';
 import { authenticator } from 'otplib';
 
-
+// ✅ Adapte ces imports si tes modèles sont ailleurs
 import { User } from '../../models/user.model';
 import { RefreshToken } from '../../models/refresh-token.model';
 
-function sha256(input: string) {
-  return createHash('sha256').update(input).digest('hex');
-}
+type AccessPayload = {
+  sub: number;
+  tenant_id: number | null;
+  role: string | null;
+  imp: boolean;
+  imp_by?: number | null;
+};
+
+type RefreshPayload = {
+  sub: number;
+  typ: 'refresh';
+};
 
 @Injectable()
 export class AuthService {
   constructor(
-    @InjectModel(User) private userModel: typeof User,
-    @InjectModel(RefreshToken) private rtModel: typeof RefreshToken,
-    private cfg: ConfigService,
-    private jwt: JwtService,
+    private readonly jwt: JwtService,
+    @InjectModel(User) private readonly userModel: typeof User,
+    @InjectModel(RefreshToken) private readonly rtModel: typeof RefreshToken,
   ) {}
 
+  // ------------------------------------------------------------
+  // A) LOGIN
+  // ------------------------------------------------------------
   async validateUser(email: string, password: string) {
     const user = await this.userModel.findOne({ where: { email } });
-    if (!user) throw new UnauthorizedException('Invalid credentials');
+    if (!user) return null;
 
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) throw new UnauthorizedException('Invalid credentials');
+    const hash = (user as any).password_hash ?? (user as any).passwordHash;
+    if (!hash) return null;
+
+    const ok = await bcrypt.compare(password, hash);
+    if (!ok) return null;
 
     return user;
   }
 
-  private signAccess(user: User) {
-    return this.jwt.sign(
-      { sub: user.id, tenant_id: user.tenant_id, role: user.role, imp: false },
-      { secret: this.cfg.get('JWT_ACCESS_SECRET'), expiresIn: '15m' },
-    );
-  }
-
-  private signAccessImpersonated(admin: User, target: User) {
-    return this.jwt.sign(
-      { sub: target.id, tenant_id: target.tenant_id, role: target.role, imp: true, imp_by: admin.id },
-      { secret: this.cfg.get('JWT_ACCESS_SECRET'), expiresIn: '15m' },
-    );
-  }
-
-  private signRefresh(user: User) {
-    return this.jwt.sign(
-      { sub: user.id, typ: 'refresh' },
-      { secret: this.cfg.get('JWT_REFRESH_SECRET'), expiresIn: '30d' },
-    );
-  }
-
+  // ------------------------------------------------------------
+  // B) TOKENS
+  // ------------------------------------------------------------
   async issueTokens(user: User) {
-    const access = this.signAccess(user);
-    const refreshPlain = this.signRefresh(user);
+    const id = Number((user as any).id);
+    const tenantIdRaw = (user as any).tenant_id ?? (user as any).tenantId ?? null;
+    const tenant_id = tenantIdRaw === null ? null : Number(tenantIdRaw);
+    const role = ((user as any).role ?? null) as string | null;
 
-        await RefreshToken.create({
-        user_id: user.id,
-        token_hash: sha256(refreshPlain),
-        expires_at: new Date(Date.now() + 30 * 24 * 3600 * 1000),
-        revoked_at: null,
-        } as any);
+    if (!id) throw new UnauthorizedException('Invalid user');
 
+    const accessPayload: AccessPayload = {
+      sub: id,
+      tenant_id,
+      role,
+      imp: false,
+    };
 
-    return { access, refresh: refreshPlain };
+    const access = this.jwt.sign(accessPayload, {
+      secret: process.env.JWT_ACCESS_SECRET!,
+      expiresIn: Number(process.env.JWT_ACCESS_EXPIRES_SEC ?? 900), // 15 min
+    });
+
+    const refreshPayload: RefreshPayload = { sub: id, typ: 'refresh' };
+
+    const refresh = this.jwt.sign(refreshPayload, {
+      secret: process.env.JWT_REFRESH_SECRET!,
+      expiresIn: Number(process.env.JWT_REFRESH_EXPIRES_SEC ?? 2592000), // 30j
+    });
+
+    // Stocke un hash du refresh (jamais le token en clair)
+    const token_hash = this.sha256(refresh);
+    const expires_at = new Date(
+      Date.now() + Number(process.env.JWT_REFRESH_EXPIRES_SEC ?? 2592000) * 1000,
+    );
+
+    await this.rtModel.create({
+      user_id: id,
+      token_hash,
+      expires_at,
+      revoked_at: null,
+    } as any);
+
+    return { access, refresh };
   }
 
   async rotateRefresh(oldRefresh: string) {
-    // verify
     let payload: any;
     try {
-      payload = this.jwt.verify(oldRefresh, { secret: this.cfg.get('JWT_REFRESH_SECRET') });
+      payload = this.jwt.verify(oldRefresh, { secret: process.env.JWT_REFRESH_SECRET! });
     } catch {
       throw new UnauthorizedException('Invalid refresh');
     }
 
-    const row = await this.rtModel.findOne({ where: { token_hash: sha256(oldRefresh), revoked_at: null } });
+    if (!payload?.sub || payload?.typ !== 'refresh') {
+      throw new UnauthorizedException('Invalid refresh');
+    }
+
+    const userId = Number(payload.sub);
+
+    // Vérifie en DB que ce refresh existe et n'est pas révoqué
+    const oldHash = this.sha256(oldRefresh);
+    const row = await this.rtModel.findOne({
+      where: { user_id: userId, token_hash: oldHash, revoked_at: null },
+    });
+
     if (!row) throw new UnauthorizedException('Refresh revoked');
 
-    // revoke old
-    row.revoked_at = new Date();
-    await row.save();
+    // Rotation : on révoque l'ancien
+    await row.update({ revoked_at: new Date() } as any);
 
-    const user = await this.userModel.findByPk(payload.sub);
+    // Recharge user pour remettre tenant_id/role dans le nouvel access
+    const user = await this.userModel.findByPk(userId);
     if (!user) throw new UnauthorizedException('User not found');
 
-    return this.issueTokens(user);
+    return this.issueTokens(user as any);
   }
 
-  // ---------- 2FA ----------
-  private getEncKey() {
-    const key = this.cfg.get<string>('TOTP_ENCRYPTION_KEY') || '';
-    if (key.length < 32) throw new Error('TOTP_ENCRYPTION_KEY must be at least 32 chars');
-    return createHash('sha256').update(key).digest(); // 32 bytes
-  }
-
-  encrypt(text: string) {
-    const iv = randomBytes(12);
-    const key = this.getEncKey();
-    const cipher = createCipheriv('aes-256-gcm', key, iv);
-    const enc = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
-    const tag = cipher.getAuthTag();
-    return Buffer.concat([iv, tag, enc]).toString('base64');
-  }
-
-  decrypt(b64: string) {
-    const buf = Buffer.from(b64, 'base64');
-    const iv = buf.subarray(0, 12);
-    const tag = buf.subarray(12, 28);
-    const enc = buf.subarray(28);
-    const key = this.getEncKey();
-    const decipher = createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(tag);
-    const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
-    return dec.toString('utf8');
-  }
-
+  // ------------------------------------------------------------
+  // C) 2FA (TOTP via otplib) - sans QR backend
+  // ------------------------------------------------------------
   async setup2fa(userId: number) {
     const user = await this.userModel.findByPk(userId);
-    if (!user) throw new UnauthorizedException();
+    if (!user) throw new UnauthorizedException('User not found');
 
-    const secret = authenticator.generateSecret();
-    const otpauth = authenticator.keyuri(user.email, 'MargeWeb Builder', secret);
+    const secret = authenticator.generateSecret(); // base32
 
-    // store encrypted secret but NOT enabled yet
-    user.totp_secret_enc = this.encrypt(secret);
-    user.is_2fa_enabled = false;
+    (user as any).totp_secret_enc = this.encrypt(secret);
     await user.save();
 
-    return { otpauth };
+    const email = (user as any).email ?? 'user';
+    const otpauth_url = authenticator.keyuri(email, 'MargeWeb Builder', secret);
+
+    // V1: pas de QR backend
+    return { otpauth_url };
   }
 
   async verify2faAndEnable(userId: number, code: string) {
     const user = await this.userModel.findByPk(userId);
-    if (!user || !user.totp_secret_enc) throw new UnauthorizedException();
+    if (!user) throw new UnauthorizedException('User not found');
 
-    const secret = this.decrypt(user.totp_secret_enc);
-    const ok = authenticator.check(code, secret);
+    const ok = await this.check2fa(user as any, code);
     if (!ok) throw new UnauthorizedException('Invalid 2FA code');
 
-    user.is_2fa_enabled = true;
+    (user as any).is_2fa_enabled = true;
     await user.save();
+
     return { ok: true };
   }
 
   async check2fa(user: User, code: string) {
-    if (!user.is_2fa_enabled) return true;
-    if (!user.totp_secret_enc) throw new UnauthorizedException();
+    const enc = (user as any).totp_secret_enc;
+    if (!enc) return false;
 
-    const secret = this.decrypt(user.totp_secret_enc);
-    return authenticator.check(code, secret);
+    const secret = this.decrypt(enc);
+    return authenticator.check(String(code), secret);
   }
 
-      private sign2faChallenge(user: User) {
-    // token très court, ne donne pas accès: seulement pour valider le 2FA
-    return this.jwt.sign(
-      { sub: user.id, tenant_id: user.tenant_id, role: user.role, typ: '2fa' },
-      { secret: this.cfg.get('JWT_ACCESS_SECRET'), expiresIn: '5m' },
-    );
+  // ------------------------------------------------------------
+  // D) CRYPTO / HELPERS (AES-256-GCM)
+  // ------------------------------------------------------------
+  private sha256(s: string) {
+    return crypto.createHash('sha256').update(s).digest('hex');
   }
 
-  // ---------- 2FA CHALLENGE ----------
-  create2faChallenge(user: User) {
-    return this.jwt.sign(
-      { sub: user.id, tenant_id: user.tenant_id, role: user.role, typ: '2fa' },
-      { secret: this.cfg.get('JWT_ACCESS_SECRET'), expiresIn: '5m' },
-    );
+  /**
+   * AES-256-GCM encryption:
+   * - key: AUTH_ENC_KEY (32 bytes base64 or hex)
+   * - output: base64(iv).base64(tag).base64(ciphertext)
+   */
+  private encrypt(plain: string): string {
+    const key = this.getEncKey();
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+    const ciphertext = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+
+    return `${iv.toString('base64')}.${tag.toString('base64')}.${ciphertext.toString('base64')}`;
   }
 
-  verify2faChallengeToken(token: string) {
-    try {
-      const payload = this.jwt.verify(token, { secret: this.cfg.get('JWT_ACCESS_SECRET') });
-      if (payload.typ !== '2fa') throw new Error('bad typ');
-      return payload;
-    } catch {
-      throw new UnauthorizedException('Invalid 2FA challenge');
+  private decrypt(enc: string): string {
+    const key = this.getEncKey();
+
+    const parts = enc.split('.');
+    if (parts.length !== 3) throw new UnauthorizedException('Invalid encrypted secret');
+
+    const iv = Buffer.from(parts[0], 'base64');
+    const tag = Buffer.from(parts[1], 'base64');
+    const ciphertext = Buffer.from(parts[2], 'base64');
+
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+
+    const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return plain.toString('utf8');
+  }
+
+  private getEncKey(): Buffer {
+    const raw = process.env.AUTH_ENC_KEY;
+    if (!raw) {
+      throw new Error('AUTH_ENC_KEY missing (must be 32 bytes)');
     }
+
+    // accepte base64 (recommandé) ou hex
+    const key = raw.includes('/') || raw.includes('+') || raw.endsWith('=')
+      ? Buffer.from(raw, 'base64')
+      : Buffer.from(raw, 'hex');
+
+    if (key.length !== 32) {
+      throw new Error(`AUTH_ENC_KEY must be 32 bytes, got ${key.length}`);
+    }
+    return key;
   }
 }

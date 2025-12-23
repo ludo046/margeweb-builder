@@ -1,15 +1,23 @@
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 
 export class CreateSiteDto {
-  @IsString() @MaxLength(120)
+  @IsInt()
+  @Min(1)
+  tenant_id!: number;
+
+  @IsString()
+  @MaxLength(120)
   name!: string;
 
-  @IsString() @MaxLength(80)
-  slug!: string;
-
-  @IsOptional() @IsString() @MaxLength(190)
-  domain?: string;
-
-  @IsOptional() @IsString() @MaxLength(80)
+  // ex: "demo" => demo.margeweb.fr (plus tard)
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
   subdomain?: string;
+
+  // ex: "client.fr" (plus tard)
+  @IsOptional()
+  @IsString()
+  @MaxLength(190)
+  domain?: string;
 }

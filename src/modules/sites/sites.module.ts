@@ -1,15 +1,18 @@
 import { Module } from '@nestjs/common';
 import { SequelizeModule } from '@nestjs/sequelize';
-import { AuthModule } from '../auth/auth.module';
-import { Site } from '../../models/site.model';
-import { Page } from '../../models/page.model';
-import { Section } from '../../models/section.model';
+
 import { SitesController } from './sites.controller';
 import { SitesService } from './sites.service';
+import { Site } from '../../models/site.model';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [SequelizeModule.forFeature([Site, Page, Section]), AuthModule],
+  imports: [
+    AuthModule,
+    SequelizeModule.forFeature([Site]),
+  ],
   controllers: [SitesController],
   providers: [SitesService],
+  exports: [SitesService],
 })
 export class SitesModule {}

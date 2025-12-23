@@ -3,30 +3,30 @@ import { JwtService } from '@nestjs/jwt';
 
 @Injectable()
 export class JwtCookieAuthGuard implements CanActivate {
-  constructor(private jwt: JwtService) {}
+  constructor(private readonly jwt: JwtService) {}
 
-  canActivate(ctx: ExecutionContext): boolean {
-    const req = ctx.switchToHttp().getRequest();
-
-    console.log('[GUARD] canActivate called');
-    console.log('[GUARD] cookie mw_access?', !!req.cookies?.mw_access);
-
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest();
     const token = req.cookies?.mw_access;
-    if (!token) {
-      console.log('[GUARD] Missing access token');
-      throw new UnauthorizedException('Missing access token');
-    }
 
-    const secret = process.env.JWT_ACCESS_SECRET;
-    if (!secret) throw new Error('JWT_ACCESS_SECRET missing');
+    if (!token) throw new UnauthorizedException('Missing access token');
 
     try {
-      const payload = this.jwt.verify(token, { secret });
-      req.user = payload;
-      console.log('[GUARD] JWT OK for user', payload.sub);
+      const payload: any = this.jwt.verify(token, {
+        secret: process.env.JWT_ACCESS_SECRET!,
+      });
+
+      // ✅ Normalisation (très important)
+      req.user = {
+        sub: payload.sub,
+        tenant_id: payload.tenant_id ?? payload.tenantId ?? null,
+        role: payload.role ?? null,
+        imp: !!payload.imp,
+        imp_by: payload.imp_by ?? payload.impBy ?? null,
+      };
+
       return true;
-    } catch (err: any) {
-      console.log('[GUARD] JWT verify failed:', err?.name, err?.message);
+    } catch {
       throw new UnauthorizedException('Invalid access token');
     }
   }

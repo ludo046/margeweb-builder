@@ -21,21 +21,19 @@ import { SitesModule } from './modules/sites/sites.module';
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
 
-    SequelizeModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (cfg: ConfigService) => ({
-        dialect: 'mysql',
-        host: cfg.get<string>('DB_HOST'),
-        port: Number(cfg.get<string>('DB_PORT')),
-        database: cfg.get<string>('DB_NAME'),
-        username: cfg.get<string>('DB_USER'),
-        password: cfg.get<string>('DB_PASS'),
-        models: [Tenant, User, RefreshToken, ImpersonationLog, Ticket, TicketMessage],
-        autoLoadModels: false,
-        synchronize: false,
-        logging: false,
-      }),
-    }),
+    SequelizeModule.forRoot({
+  dialect: 'mysql',
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT ?? 3306),
+  username: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+
+  autoLoadModels: true,
+  synchronize: false,
+  logging: false,
+}),
+
 
     AuthModule,
 

@@ -1,22 +1,22 @@
 import { Module } from '@nestjs/common';
 import { SequelizeModule } from '@nestjs/sequelize';
-import { JwtModule } from '@nestjs/jwt';
 
-import { User } from '../../models/user.model';
-import { ImpersonationLog } from '../../models/impersonation-log.model';
-import { AuthModule } from '../auth/auth.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 import { AdminOnlyGuard } from './admin-only.guard';
 
+import { User } from '../../models/user.model';
+import { ImpersonationLog } from '../../models/impersonation-log.model';
+
+import { AuthModule } from '../auth/auth.module'; // ✅ IMPORTANT
 
 @Module({
   imports: [
-    SequelizeModule.forFeature([User, ImpersonationLog, AdminOnlyGuard]),
-    JwtModule.register({}),
-    AuthModule,
+    AuthModule, // ✅ fournit JwtService (via export JwtModule)
+    SequelizeModule.forFeature([User, ImpersonationLog]),
   ],
   controllers: [AdminController],
-  providers: [AdminService],
+  providers: [AdminService, AdminOnlyGuard],
+  exports: [AdminService],
 })
 export class AdminModule {}

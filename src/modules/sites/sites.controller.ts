@@ -1,42 +1,35 @@
-import { Body, Controller, Get, Param, ParseIntPipe, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import { JwtCookieAuthGuard } from '../auth/jwt-cookie.guard';
+import { AdminOnlyGuard } from '../admin/admin-only.guard';
 import { SitesService } from './sites.service';
 import { CreateSiteDto } from './dto/create-site.dto';
-import { CreatePageDto } from './dto/create-page.dto';
-import { CreateSectionDto } from './dto/create-section.dto';
+import { UpdateSiteDto } from './dto/update-sites.dto';
 
 @Controller()
-@UseGuards(JwtCookieAuthGuard)
 export class SitesController {
-  constructor(private sites: SitesService) {}
+  constructor(private readonly sites: SitesService) {}
 
+  @UseGuards(JwtCookieAuthGuard)
   @Get('sites')
-  listSites(@Req() req: any) {
+  async listSites(@Req() req: any) {
     return this.sites.listSites(req.user);
   }
 
+  @UseGuards(JwtCookieAuthGuard, AdminOnlyGuard)
   @Post('sites')
-  createSite(@Req() req: any, @Body() dto: CreateSiteDto) {
-    return this.sites.createSite(req.user, dto);
+  async createSite(@Body() dto: CreateSiteDto) {
+    return this.sites.createSite(dto);
   }
 
-  @Get('sites/:siteId/pages')
-  listPages(@Req() req: any, @Param('siteId', ParseIntPipe) siteId: number) {
-    return this.sites.listPages(req.user, siteId);
+  @UseGuards(JwtCookieAuthGuard)
+  @Get('sites/:id')
+  async getSite(@Req() req: any, @Param('id') id: string) {
+    return this.sites.getSite(req.user, Number(id));
   }
 
-  @Post('sites/:siteId/pages')
-  createPage(@Req() req: any, @Param('siteId', ParseIntPipe) siteId: number, @Body() dto: CreatePageDto) {
-    return this.sites.createPage(req.user, siteId, dto);
-  }
-
-  @Get('pages/:pageId/sections')
-  listSections(@Req() req: any, @Param('pageId', ParseIntPipe) pageId: number) {
-    return this.sites.listSections(req.user, pageId);
-  }
-
-  @Post('pages/:pageId/sections')
-  createSection(@Req() req: any, @Param('pageId', ParseIntPipe) pageId: number, @Body() dto: CreateSectionDto) {
-    return this.sites.createSection(req.user, pageId, dto);
+  @UseGuards(JwtCookieAuthGuard)
+  @Patch('sites/:id')
+  async updateSite(@Req() req: any, @Param('id') id: string, @Body() dto: UpdateSiteDto) {
+    return this.sites.updateSite(req.user, Number(id), dto);
   }
 }
